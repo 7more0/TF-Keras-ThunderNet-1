@@ -16,15 +16,18 @@ from thundernet.layers.snet import snet_146
 from thundernet.layers.detector import rpn_layer, classifier_layer
 
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 # ----------------------------- Path_config ------------------------------ #
-base_path = '/data2/intern/TF-Keras-ThunderNet/'
-#test_path = '/data2/intern/TF-Keras-ThunderNet/data/train_list.txt'
-test_base_path = '/data2/intern/TF-Keras-ThunderNet/data/test_cube'
-config_output_filename = os.path.join(base_path, 'model/model_snet_config.pickle')
-
+base_path = './intern/'
+test_path = './data/Boats/train/val.txt'
+test_base_path = './data/Boats/test/Images/'
+# test_path = './data/VOC2007/train/train.txt'
+# test_base_path = 'E:/A/WorkShop/DL/ObjectDetection/Dataset/Boats/NIR/Images/'
+config_output_filename = os.path.join(base_path, 'model_snet_config.pickle')
+output_path = './data/res/{}'
+res_data_out = './data/res.txt'
 # ------------------------------- Config ----------------------------------- #
 with open(config_output_filename, 'rb') as f_in:
     C = pickle.load(f_in)
@@ -47,13 +50,13 @@ def format_img_size(img, C):
 
 def format_img_channels(img, C):
     """ formats the image channels based on config """
-    img = img[:, :, (2, 1, 0)]
+    img = img[:, :, (2, 1, 0)]      # RGB
     img = img.astype(np.float32)
     img[:, :, 0] -= C.img_channel_mean[0]
     img[:, :, 1] -= C.img_channel_mean[1]
     img[:, :, 2] -= C.img_channel_mean[2]
     img /= C.img_scaling_factor
-    img = np.transpose(img, (2, 0, 1))
+    img = np.transpose(img, (2, 0, 1))      # (channels, h, w)
     img = np.expand_dims(img, axis=0)
     return img
 
@@ -67,7 +70,6 @@ def format_img(img, C):
 
 # Method to transform the coordinates of the bounding box to its original size
 def get_real_coordinates(ratio_h, ratio_w, x1, y1, x2, y2):
-
     real_x1 = int(round(x1 * ratio_w))
     real_y1 = int(round(y1 * ratio_h))
     real_x2 = int(round(x2 * ratio_w))
@@ -89,7 +91,7 @@ feature_map_input = Input(shape=input_shape_features)
 shared_layers = snet_146(img_input)
 
 # define the RPN, built on the base layers
-num_anchors = len(C.anchor_box_scales) * len(C.anchor_box_ratios)
+num_anchors = len(C.anchor_box_scales) * len(C.anchor_box_ratios)       # 9
 rpn_layers = rpn_layer(shared_layers, num_anchors)
 
 classifier = classifier_layer(feature_map_input, roi_input, C.num_rois, nb_classes=len(C.class_mapping))
@@ -115,8 +117,9 @@ class_to_color = {class_mapping[v]: np.random.randint(0, 255, 3) for v in class_
 test_imgs = os.listdir(test_base_path)
 
 imgs_path = []
-for i in range(485):
-    idx = np.random.randint(len(test_imgs))
+test_img_num = len(test_imgs)
+for i in range(test_img_num):           #
+    idx = np.random.randint(test_img_num)         # shuffle
     imgs_path.append(test_imgs[idx])
 
 all_imgs = []
@@ -124,11 +127,13 @@ all_imgs = []
 classes = {}
 
 # -------------------------------------------------------- #
-#                     Start Testing                     #
+#                     Start Testing                        #
 # -------------------------------------------------------- #
 # If the box classification value is less than this, we ignore this box
-bbox_threshold = 0.0
+bbox_threshold = 0.5
+overlap_threshold = 0.9
 
+res_file = open(res_data_out, 'w+')
 for idx, img_name in enumerate(imgs_path):
     if not img_name.lower().endswith(('.bmp', '.jpeg', '.jpg', '.png', '.tif', '.tiff')):
         continue
@@ -151,9 +156,9 @@ for idx, img_name in enumerate(imgs_path):
     #     print(Y1.shape)
     # Get bboxes by applying NMS
     # R.shape = (300, 4)
-    R = rpn_to_roi(Y1, Y2, C, 'tf', overlap_thresh=0.7)
-    print(len(R))
-    # convert from (x1,y1,x2,y2) to (x,y,w,h)
+    R = rpn_to_roi(Y1, Y2, C, 'tf', overlap_thresh=overlap_threshold, max_boxes=200)
+    print(len(R))       # <=300
+    # convert from (x1,y1,x2,y2) to (x,y,w,h)-->20X20 feature map
     R[:, 2] -= R[:, 0]
     R[:, 3] -= R[:, 1]
 
@@ -161,12 +166,12 @@ for idx, img_name in enumerate(imgs_path):
     bboxes = {}
     probs = {}
 
-    for jk in range(R.shape[0] // C.num_rois + 1):
+    for jk in range(R.shape[0] // C.num_rois + 1):      # 300//(4+1)
         ROIs = np.expand_dims(R[C.num_rois * jk:C.num_rois * (jk + 1), :], axis=0)
         if ROIs.shape[1] == 0:
             break
 
-        if jk == R.shape[0] // C.num_rois:
+        if jk == R.shape[0] // C.num_rois:      # ???
             # pad R
             curr_shape = ROIs.shape
             target_shape = (curr_shape[0], C.num_rois, curr_shape[2])
@@ -178,9 +183,11 @@ for idx, img_name in enumerate(imgs_path):
         [P_cls, P_regr] = model_classifier.predict([F, ROIs])
         #         print([P_cls, P_regr])
         # Calculate bboxes coordinates on resized image
-        for ii in range(P_cls.shape[1]):
+        for ii in range(P_cls.shape[1]):        # all bboxes in batch
             # Ignore 'bg' class
             if np.max(P_cls[0, ii, :]) < bbox_threshold or np.argmax(P_cls[0, ii, :]) == (P_cls.shape[2] - 1):
+                # print(np.argmax(P_cls[0, ii, :]))
+                # 所有类对应可能性均小于阈值/最大值为最后一类(bg)
                 continue
 
             cls_name = class_mapping[np.argmax(P_cls[0, ii, :])]
@@ -201,43 +208,50 @@ for idx, img_name in enumerate(imgs_path):
                 x, y, w, h = apply_regr(x, y, w, h, tx, ty, tw, th)
             except:
                 pass
+            # bboxes : (x1, y1, x2, y2) in 320x320 image
             bboxes[cls_name].append(
                 [C.rpn_stride * x, C.rpn_stride * y, C.rpn_stride * (x + w), C.rpn_stride * (y + h)])
             probs[cls_name].append(np.max(P_cls[0, ii, :]))
 
     all_dets = []
 
-    for key in bboxes:
+    print('Elapsed time = {}'.format(time.time() - st))
+
+    # 未检测出目标不再输出
+    if len(bboxes) == 0:
+        continue
+
+    for key in bboxes:      # all detected classes
         bbox = np.array(bboxes[key])
         print(key)
-        new_boxes, new_probs = non_max_suppression_fast(bbox, np.array(probs[key]), overlap_thresh=0.5)
+        new_boxes, new_probs = non_max_suppression_fast(bbox, np.array(probs[key]), overlap_thresh=overlap_threshold)
         for jk in range(new_boxes.shape[0]):
-            #(y1, x1, y2, x2) = new_boxes[jk, :]
             (x1, y1, x2, y2) = new_boxes[jk, :]
             print((x1, y1, x2, y2))
             # Calculate real coordinates on original image
             (real_x1, real_y1, real_x2, real_y2) = get_real_coordinates(ratio_h, ratio_w, x1, y1, x2, y2)
 
-            cv2.rectangle(img, (real_x1, real_y1), (real_x2, real_y2),
-                          (int(class_to_color[key][0]), int(class_to_color[key][1]), int(class_to_color[key][2])), 4)
+            # write result data
+            res_file.write('{} {},{},{},{},{}:{:.2f}\n'.format(test_base_path+img_name,
+                                                               real_y1, real_x1, real_y2, real_x2, key, new_probs[jk]))
 
-            textLabel = '{}: {}'.format(key, int(100 * new_probs[jk]))
+            cv2.rectangle(img, (real_x1, real_y1), (real_x2, real_y2),
+                          (int(class_to_color[key][0]), int(class_to_color[key][1]), int(class_to_color[key][2])), 2)
+
+            textLabel = '{}:{}'.format(key, int(100 * new_probs[jk]))
             all_dets.append((key, 100 * new_probs[jk]))
 
             (retval, baseLine) = cv2.getTextSize(textLabel, cv2.FONT_HERSHEY_COMPLEX, 1, 1)
-            textOrg = (real_x1, real_y1 - 0)
+            textOrg = (real_x1, real_y1)
 
             cv2.rectangle(img, (textOrg[0] - 5, textOrg[1] + baseLine - 5),
-                          (textOrg[0] + retval[0] + 5, textOrg[1] - retval[1] - 5), (0, 0, 0), 1)
+                          (textOrg[0] + retval[0] + 5, textOrg[1] - retval[1] - 5), (0, 0, 0), 1)   # bbox
             cv2.rectangle(img, (textOrg[0] - 5, textOrg[1] + baseLine - 5),
-                          (textOrg[0] + retval[0] + 5, textOrg[1] - retval[1] - 5), (255, 255, 255), -1)
-            cv2.putText(img, textLabel, textOrg, cv2.FONT_HERSHEY_DUPLEX, 1, (0, 0, 0), 1)
-    cv2.imwrite('./data/res/{}'.format(img_name), img)
-    print('Elapsed time = {}'.format(time.time() - st))
-    #print(all_dets)
-    '''  
-    plt.figure(figsize=(10, 10))
-    plt.grid()
-    plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    plt.show()
-    '''
+                          (textOrg[0] + retval[0] + 5, textOrg[1] - retval[1] - 5), (255, 255, 255), -1)    # text box
+            cv2.putText(img, textLabel, textOrg, cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 0, 0), 1)
+    cv2.imwrite(output_path.format(img_name), img)
+
+    # print(all_dets)
+res_file.close()
+
+

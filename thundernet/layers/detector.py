@@ -10,6 +10,7 @@ from tensorflow.keras.layers import Layer, Lambda, multiply
 
 from thundernet.utils.common import depthwise_conv5x5, conv1x1, batchnorm
 import numpy as np
+import matplotlib.pyplot as plt
 
 class PSRoiAlignPooling(Layer):
     """ROI pooling layer for 2D inputs.
@@ -40,6 +41,7 @@ class PSRoiAlignPooling(Layer):
 
     def build(self, input_shape):
         self.nb_channels = input_shape[0][3]
+        self.built = True
 
     def compute_output_shape(self, input_shape):
         return None, self.num_rois, self.pool_size, self.pool_size, self.alpha_channels
@@ -47,6 +49,10 @@ class PSRoiAlignPooling(Layer):
     def call(self, x, mask=None):
         assert (len(x) == 2)
         total_bins = 1
+
+        # X_img:    (1, rows, cols, channels)
+        # X_roi:    (1,num_rois,4) list of rois, with ordering (x,y,w,h)
+
         # x[0] is image with shape (rows, cols, channels)
         img = x[0]
 
@@ -54,53 +60,82 @@ class PSRoiAlignPooling(Layer):
         rois = x[1]
 
         # because crop_size of tf.crop_and_resize requires 1-D tensor, we use uniform length
+        # crop_size: (2) = [crop_height, crop_width]
         bin_crop_size = []
-        for num_bins, crop_dim in zip((7, 7), (14, 14)):
+        for num_bins, crop_dim in zip((7, 7), (14, 14)):        # ???
             assert num_bins >= 1
             assert crop_dim % num_bins == 0
-            total_bins *= num_bins
-            bin_crop_size.append(crop_dim // num_bins)
+            total_bins *= num_bins      # 49
+            bin_crop_size.append(crop_dim // num_bins)      # [2, 2]
+        '''
+        xmin, ymin, xmax, ymax = tf.unstack(rois[0], axis=1)        # roi[0] (num_roi, 4)
+        spatial_bins_y = spatial_bins_x = 7
+        step_y = (ymax - ymin) / spatial_bins_y     # bin length y (num_roi)
+        step_x = (xmax - xmin) / spatial_bins_x     # bin length x
+        '''
 
-        xmin, ymin, xmax, ymax = tf.unstack(rois[0], axis=1)
-        spatial_bins_y =  spatial_bins_x = 7
-        step_y = (ymax - ymin) / spatial_bins_y
-        step_x = (xmax - xmin) / spatial_bins_x
+        # input should be shape as (x, y, w, h)
+        x, y, w, h = tf.unstack(rois[0], axis=1)
+        spatial_bins_y = spatial_bins_x = 7
+        step_y = h / spatial_bins_y
+        step_x = w / spatial_bins_x
 
         # gen bins
         position_sensitive_boxes = []
-        for bin_x in range(self.pool_size): 
+        '''
+        for bin_x in range(self.pool_size):         # 0~6
             for bin_y in range(self.pool_size):
                 box_coordinates = [
                     ymin + bin_y * step_y,
                     xmin + bin_x * step_x,
                     ymin + (bin_y + 1) * step_y,
                     xmin + (bin_x + 1) * step_x 
-                ]
-                position_sensitive_boxes.append(tf.stack(box_coordinates, axis=1))
-        
+                ]       # 4*[(num_roi)]
+                position_sensitive_boxes.append(tf.stack(box_coordinates, axis=1))      # (49, num_roi, 4) 对所有roi的所有bin的参数
+        '''
+        img_w, img_h = 20, 20       # roi bins coord normalize to [0, 1]
+        for bin_x in range(self.pool_size):         # 0~6
+            for bin_y in range(self.pool_size):
+                # coordinates should be (y1, x1, y2, x2)
+                box_coordinates = [
+                    (y + bin_y * step_y)/img_h,
+                    (x + bin_x * step_x)/img_w,
+                    (y + (bin_y + 1) * step_y)/img_h,
+                    (x + (bin_x + 1) * step_x)/img_w
+                ]       # 4*[(num_roi)]
+                position_sensitive_boxes.append(tf.stack(box_coordinates, axis=1))      # (49, num_roi, 4) 对所有roi的所有bin的参数
+
+        # img: (1, rows, cols, channels) divide channels to 49 feature maps
         img_splits = tf.split(img, num_or_size_splits=total_bins, axis=3)
-        box_image_indices = np.zeros(self.num_rois)
+
+        box_image_indices = np.zeros(self.num_rois)         # (num_roi)指定roi与img的对应关系
 
         feature_crops = []
         for split, box in zip(img_splits, position_sensitive_boxes):
-            #assert box.shape[0] == box_image_indices.shape[0], "Psroi box number doesn't match roi box indices!"
+            # assert box.shape[0] == box_image_indices.shape[0], "Psroi box number doesn't match roi box indices!"
+            # roi align
             crop = tf.image.crop_and_resize(
                 split, box, box_image_indices,
                 bin_crop_size, method='bilinear'
             )
             # shape [num_boxes, crop_height/spatial_bins_y, crop_width/spatial_bins_x, depth/total_bins]
+            # crop shape (num_roi, 2, 2, 5)
+            # 在当前特征图上分割roi的对应位置bin并调整大小为bin_crop_size(2x2)
+            # 即49*feature map --> 49*bin 一一对应
 
-            # do max pooling over spatial positions within the bin
-            crop = tf.reduce_max(crop, axis=[1, 2])
+            # roi pooling
+            # do max pooling over spatial positions within the bin(axis = [1, 2])
+            # crop = tf.reduce_max(crop, axis=[1, 2])     # (num_boxes, channels)/(num_roi, 5)
+            crop = tf.reduce_mean(crop, axis=[1, 2])
             crop = tf.expand_dims(crop, 1)
             # shape [num_boxes, 1, depth/total_bins]
 
             feature_crops.append(crop)
 
-        final_output = K.concatenate(feature_crops, axis=1)
+        final_output = K.concatenate(feature_crops, axis=1)     # (num_boxes, 49, depth)
 
         # Reshape to (1, num_rois, pool_size, pool_size, nb_channels)
-        # Might be (1, 4, 7, 7, 5)
+        # Might be (1, n, 7, 7, 5)
         final_output = K.reshape(final_output, (1, self.num_rois, self.pool_size, self.pool_size, self.alpha_channels))
 
         # permute_dimensions is similar to transpose
@@ -172,10 +207,11 @@ class RoiPoolingConv(Layer):
             h = K.cast(h, 'int32')
 
             # Resized roi of the image to pooling size (7x7)
-            rs = tf.image.resize_images(img[:, y:y + h, x:x + w, :], (self.pool_size, self.pool_size))
+            rs = tf.image.resize(img[:, y:y + h, x:x + w, :], (self.pool_size, self.pool_size))      # 截取roi并resize
             outputs.append(rs)
 
-        final_output = K.concatenate(outputs, axis=0)
+        # output num_rois*[pool_size, pool_size, channels]
+        final_output = K.concatenate(outputs, axis=0)       # (num_roi, 7, 7, channels)
 
         # Reshape to (1, num_rois, pool_size, pool_size, nb_channels)
         # Might be (1, 4, 7, 7, 3)
@@ -222,6 +258,7 @@ def rpn_layer(base_layers, num_anchors):
                 use_bias=True,
                 name='rpn/conv1x1')
 
+    # x_class (20, 20, 9)       x_regr (20, 20, 36)
     x_class = Conv2D(num_anchors, (1, 1), activation='sigmoid', kernel_initializer='uniform', name='rpn_out_class')(x)
     x_regr = Conv2D(num_anchors * 4, (1, 1), activation='linear', kernel_initializer='zero', name='rpn_out_regress')(x)
 
@@ -242,6 +279,7 @@ def classifier_layer(base_layers, input_rois, num_rois, nb_classes=3):
         out_class: classifier layer output
         out_regr: regression layer output
     """
+    # SAM module
     x = conv1x1(base_layers,
                 in_channels=base_layers.shape[3],
                 out_channels=245,
@@ -260,6 +298,7 @@ def classifier_layer(base_layers, input_rois, num_rois, nb_classes=3):
     # num_rois (4) 7x7 roi pooling
     # out_roi_pool = RoiPoolingConv(pooling_regions, num_rois)([x, input_rois])
     out_roi_pool = PSRoiAlignPooling(pooling_regions, num_rois, alpha)([x, input_rois])
+    # out_roi_pool = RoiPoolingConv(pooling_regions, num_rois)([x, input_rois])
 
     # Flatten the convlutional layer and connected to 2 FC and 2 dropout
     out = TimeDistributed(Flatten(name='flatten'))(out_roi_pool)

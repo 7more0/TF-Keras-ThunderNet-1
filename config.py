@@ -10,6 +10,9 @@ class Config:
         # Feature extract network, in the paper use snet-146
         self.network = 'snet'
 
+        # train rpn network first
+        self.train_rpn_first = False
+
         # Setting for data augmentation
         self.use_horizontal_flips = False
         self.use_vertical_flips = False
@@ -34,7 +37,7 @@ class Config:
         self.num_rois = 4
 
         # stride at the RPN
-        self.rpn_stride = 16
+        self.rpn_stride = 16        # 320/20
 
         self.balanced_classes = False
 

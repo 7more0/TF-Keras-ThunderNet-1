@@ -7,15 +7,17 @@ from thundernet.utils.common import conv1x1, depthwise_conv5x5, conv1x1_block, c
 
 
 def context_enhancement_module(x1, x2, x3, size, name='cem_block'):
+    # x1, x2, x3 = c4, c5, c_glb
     x1 = conv1x1(x1,
                  in_channels=x1.shape[3],
                  out_channels=245,
                  strides=1,
                  groups=1,
                  use_bias=True,
-                 name='{}/c4_lat'.format(name))
+                 name='{}/c4_lat'.format(name))     # C4(20, 20, channels) 1x1 conv --> (h, w, 245)
 
-    x2 = nn.Lambda(lambda img: tf.image.resize_bilinear(img, [20, 20],
+    # C5(10, 10, channels) --> (20, 20, channels)
+    x2 = nn.Lambda(lambda img: tf.compat.v1.image.resize_bilinear(img, [20, 20],
                                                         align_corners=True,
                                                         name='{}/c5_resize'.format(name)))(x2)
     x2 = conv1x1(x2,
@@ -24,18 +26,24 @@ def context_enhancement_module(x1, x2, x3, size, name='cem_block'):
                  strides=1,
                  groups=1,
                  use_bias=True,
-                 name='{}/c5_lat'.format(name))
+                 name='{}/c5_lat'.format(name))     # C5(1x1 conv --> (w, h, 245)
 
-    zero = K.zeros((1, size, size, 528))
-    x3 = nn.Lambda(lambda img: nn.add([img, zero]))(x3)
+    # x3 broadcast, x3.shape[0] is none when model define
+    # zero = K.zeros((batch_size, size, size, 528))
+    # x3 = nn.Lambda(lambda img: nn.add([img, zero]))(x3)
+    x3 = tf.expand_dims(x3, 1)
+    x3 = tf.expand_dims(x3, 1)
+    # print(x3)
     x3 = conv1x1(x3,
-                 in_channels=x3.shape[3],
+                 in_channels=x3.shape[1],
                  out_channels=245,
                  strides=1,
                  groups=1,
                  use_bias=True,
                  name='{}/c_glb_lat'.format(name))
-    print(x1)
+    zero = tf.zeros_like(x2)            # C_glb broadcast
+    x3 = nn.add([x3, zero])
+    # print(x1)
     return nn.add([x1, x2, x3])
 
 
@@ -49,6 +57,7 @@ def shuffle_unit(x,
     mid_channels = out_channels // 2
 
     if downsample:
+        # identity branch
         y1 = depthwise_conv5x5(
             x=x,
             channels=in_channels,
@@ -68,14 +77,15 @@ def shuffle_unit(x,
         y1 = nn.Activation("relu", name=name + "/expand_activ5")(y1)
         x2 = x
     else:
+
         in_split2_channels = in_channels // 2
-        if is_channels_first():
+        if is_channels_first():     # x(batch_num, channels, h, w)
             y1 = nn.Lambda(lambda z: z[:, 0:in_split2_channels, :, :])(x)
             x2 = nn.Lambda(lambda z: z[:, in_split2_channels:, :, :])(x)
         else:
             y1 = nn.Lambda(lambda z: z[:, :, :, 0:in_split2_channels])(x)
             x2 = nn.Lambda(lambda z: z[:, :, :, in_split2_channels:])(x)
-
+    # residual branch
     y2 = conv1x1(
         x=x2,
         in_channels=(in_channels if downsample else mid_channels),
@@ -114,7 +124,7 @@ def shuffle_unit(x,
     if use_residual and not downsample:
         y2 = nn.add([y2, x2], name=name + "/add")
 
-    x = nn.concatenate([y1, y2], axis=get_channel_axis(), name=name + "/concat")
+    x = nn.concatenate([y1, y2], axis=get_channel_axis(), name=name + "/concat")        # channel concat
 
     x = channel_shuffle_lambda(
         channels=out_channels,
@@ -164,10 +174,11 @@ def shufflenetv2(x,
         name="features/init_block")
     in_channels = init_block_channels
 
-    count_stage = 1
+    count_stage = 1     # stage of output
     for i, channels_per_stage in enumerate(channels):
+        print('stage {}'.format(count_stage+1))
         for j, out_channels in enumerate(channels_per_stage):
-            downsample = (j == 0)
+            downsample = (j == 0)       # do down-sample in the first block of each stage
             x = shuffle_unit(
                 x=x,
                 in_channels=in_channels,
@@ -218,10 +229,10 @@ def get_shufflenetv2(x,
                      root=os.path.join('~', '.keras', 'models'),
                      **kwargs):
 
-    init_block_channels = 24
-    final_block_channels = 512
-    layers = [4, 8, 4]
-    channels_per_layers = [132, 264, 528]
+    init_block_channels = 24    # channel number of conv1 and pool1
+    final_block_channels = 512      # conv5(snet49)
+    layers = [4, 8, 4]      # block number of each stage
+    channels_per_layers = [132, 264, 528]       # channels of feature maps in each stage
 
     channels = [[ci] * li for (ci, li) in zip(channels_per_layers, layers)]
     # print(channels)
